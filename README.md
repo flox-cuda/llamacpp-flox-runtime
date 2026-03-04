@@ -91,7 +91,7 @@ llamacpp-preflight && llamacpp-resolve-model && llamacpp-serve
 │  ┌────────────────────────────────────────────────────┐  │
 │  │  llamacpp-preflight                                │  │
 │  │    Port reclaim ← /proc/net/tcp + /proc/<pid>/     │  │
-│  │    GPU health   ← nvidia-smi (no torch needed)     │  │
+│  │    GPU health   ← CUDA driver / NVML / nvidia-smi   │  │
 │  ├────────────────────────────────────────────────────┤  │
 │  │  llamacpp-resolve-model                            │  │
 │  │    Sources: local → hf-cache → r2 → hf-hub        │  │
@@ -105,7 +105,7 @@ llamacpp-preflight && llamacpp-resolve-model && llamacpp-serve
 └──────────────────────────────────────────────────────────┘
 ```
 
-1. **llamacpp-preflight** — Reclaims the port if occupied by a stale llama-server process, checks GPU health via nvidia-smi, optionally executes a downstream command.
+1. **llamacpp-preflight** — Reclaims the port if occupied by a stale llama-server process, checks GPU health via a 3-tier cascade (CUDA driver → NVML → nvidia-smi), optionally executes a downstream command.
 2. **llamacpp-resolve-model** — Provisions the GGUF model from configured sources with locking, staging, atomic swaps, and sha256 integrity verification. Writes a per-model env file.
 3. **llamacpp-serve** — Loads the env file (safe or trusted mode), validates all required vars, builds the `llama-server` argv from env vars, and `exec`s.
 
@@ -426,7 +426,8 @@ In dry-run mode (`LLAMACPP_DRY_RUN=1`), exit codes are `0`/`2`/`3`/`4` only (nev
 | `LLAMACPP_SKIP_GPU_CHECK` | `0` | `0` or `1` | Skip all GPU checks |
 | `LLAMACPP_ALLOW_KILL_OTHER_UID` | `0` | `0` or `1` | Allow killing llama-server owned by other UIDs |
 | `LLAMACPP_KILL_PG` | `0` | `0` or `1` | Prefer signaling the process group when root is a group leader |
-| `LLAMACPP_PREFLIGHT_LOCKFILE` | `/tmp/llamacpp-preflight.<port>.lock` | — | Lock file path (per-port by default) |
+| `LLAMACPP_PREFLIGHT_LOCKDIR` | `XDG_RUNTIME_DIR` → `/run/user/<uid>` → `/tmp` (root: `/run/llamacpp-preflight`) | — | Base directory for lock files. When running as root, `/tmp` is refused — must use `/run` or `/var/lock` |
+| `LLAMACPP_PREFLIGHT_LOCKFILE` | `<lockdir>/llamacpp-preflight.<port>.lock` | — | Lock file path (overrides `LLAMACPP_PREFLIGHT_LOCKDIR`; per-port by default) |
 | `LLAMACPP_HOLD_LOCK` | `0` | `0` or `1` | Keep lock held for downstream process lifetime (requires flock) |
 | `LLAMACPP_TERM_GRACE` | `3` | Numeric, >= 0 | Seconds to wait after SIGTERM before SIGKILL |
 | `LLAMACPP_PORT_FREE_TIMEOUT` | `10` | Numeric, >= 0 | Seconds to wait for port to free after killing |
@@ -442,25 +443,32 @@ LLAMACPP_OWNER_REGEX='llama[-_]?server'
 ### Port reclaim behavior
 
 1. Parses `/proc/net/tcp` and `/proc/net/tcp6` for LISTEN-state sockets matching the configured host and port (including wildcard `0.0.0.0`/`::` catchall).
-2. Maps socket inodes to PIDs via `/proc/<pid>/fd/` symlink scanning. If unmapped, rescans to handle listeners that exit mid-scan.
+2. Maps socket inodes to PIDs via `/proc/<pid>/fd/` symlink scanning. If unmapped, rescans to handle listeners that exit mid-scan. When `/proc/<pid>/fd` mapping fails even after rescan, falls back to `ss -ltnp` and `lsof -Fp` for PID discovery before giving up (exit 4).
 3. Reads `/proc/<pid>/comm`, `/proc/<pid>/cmdline`, and `/proc/<pid>/exe` to classify each listener as llama-server or non-llama-server:
    - **Built-in heuristic**: matches `llama-server` or `llama_server` in comm, exe basename, or first 5 cmdline tokens; also whole-word regex scan of cmdline.
    - **Custom regex**: set `LLAMACPP_OWNER_REGEX`.
    - **Exe allowlist**: set `LLAMACPP_OWNER_EXE_ALLOWLIST` with colon-separated absolute paths.
 4. **Non-llama-server listener** → exit 2 (refuses to kill). Includes systemd socket activation detection with actionable hints.
 5. **Different UID** → exit 3 (unless `LLAMACPP_ALLOW_KILL_OTHER_UID=1`).
-6. **Unmappable inodes** (after rescan) → exit 4.
-7. **Own llama-server** → kills via process tree walk (default) or process group (`LLAMACPP_KILL_PG=1`). Sends SIGTERM, waits `LLAMACPP_TERM_GRACE` seconds, refreshes the tree, then SIGKILL any survivors.
+6. **Unmappable inodes** (after rescan and ss/lsof fallback) → exit 4.
+7. **Own llama-server** → kills via process tree walk (default) or process group (`LLAMACPP_KILL_PG=1`). PID start times are recorded before signaling and verified before every kill call (PID reuse guard). Sends SIGTERM, waits `LLAMACPP_TERM_GRACE` seconds, refreshes the tree, then SIGKILL any survivors.
 8. Polls until port is free or `LLAMACPP_PORT_FREE_TIMEOUT` expires. On timeout, runs `ss` and `lsof` diagnostics, then → exit 5.
 
 ### GPU health check
 
-Uses nvidia-smi exclusively (no torch dependency). Runs after port reclaim.
+Container-friendly 3-tier cascade (no torch dependency). Runs after port reclaim.
 
+1. **CUDA driver probe** (`libcuda.so.1` via ctypes): `cuInit` → `cuDeviceGetCount` → optional `cuDriverGetVersion`. Most robust indicator inside containers where `nvidia-smi` may not exist but the CUDA driver library is bind-mounted.
+2. **Memory metrics via NVML** (`libnvidia-ml.so.1` via ctypes): `nvmlInit` → `nvmlDeviceGetCount` → per-device `nvmlDeviceGetName` + `nvmlDeviceGetMemoryInfo`. Container-friendly.
+3. **Fallback: nvidia-smi** — only when NVML is unavailable. Subprocess call with `--query-gpu` parsing.
+
+Behavior:
+- If the CUDA probe fails (driver library not found or `cuInit` error) → warning, or exit 1 in hard mode.
+- If CUDA reports 0 devices → specific message: "container likely not started with GPU access."
+- If memory metrics are unavailable from both NVML and nvidia-smi → warning, or exit 1 in hard mode.
 - Reports per-GPU name, free/total VRAM, usage percentage.
 - Warns if usage exceeds `LLAMACPP_GPU_WARN_PCT`.
 - **Hard mode** (when `LLAMACPP_GPU_FAIL_PCT` or `LLAMACPP_GPU_MIN_FREE_MIB` is set): exits 1 if thresholds are breached. In hard mode, GPU is checked *before* killing an existing llama-server to avoid stopping it when a new one cannot start.
-- When nvidia-smi is missing: soft-skip with warning (or exit 1 in hard mode).
 
 ### JSON output mode
 
@@ -469,7 +477,7 @@ When `LLAMACPP_PREFLIGHT_JSON=1`, a single JSON object is printed to stdout. Hum
 Examples:
 
 ```json
-{"status":"ok","action":"noop","host":"0.0.0.0","port":8080,"dry_run":false,"gpu":{"checked":true,"available":true,"gpus":[{"index":0,"name":"NVIDIA GeForce RTX 5090","total_mib":32768,"free_mib":31500,"used_pct":3.9}],"warned":false}}
+{"status":"ok","action":"noop","host":"0.0.0.0","port":8080,"dry_run":false,"gpu":{"checked":true,"available":true,"gpus":[{"index":0,"name":"NVIDIA GeForce RTX 5090","total_mib":32614,"free_mib":31774,"used_pct":2.6}],"warned":false,"probe":{"method":"cuda_dlopen","driver_present":true,"device_count":1,"driver_version":12090,"error":null},"memory":{"method":"nvml","error":null}}}
 {"status":"ok","action":"stopped","host":"0.0.0.0","port":8080,"dry_run":false,"pids":[12345],"gpu":{...}}
 {"status":"error","code":2,"reason":"port_owned_by_other_process","host":"0.0.0.0","port":8080,"dry_run":false,"pids":[5678]}
 {"status":"error","code":2,"reason":"systemd_socket_activation","host":"0.0.0.0","port":8080,"dry_run":false,"pids":[1],"socket_units":["llama.socket"]}
@@ -477,12 +485,26 @@ Examples:
 
 ### Locking
 
-Prevents two concurrent preflight runs from racing on the same port:
+Prevents two concurrent preflight runs from racing on the same port.
 
-- **flock** (preferred): opens `$LLAMACPP_PREFLIGHT_LOCKFILE` with `flock -n`. Validates the lockfile is not a symlink and is a regular file.
-- **mkdir fallback**: creates `$LLAMACPP_PREFLIGHT_LOCKFILE.d/` with `mkdir -m 700`. Detects stale locks via PID file. Also validates against symlinks.
-- Lock is **per-port** by default (`/tmp/llamacpp-preflight.<port>.lock`).
-- `LLAMACPP_HOLD_LOCK=1`: keeps the flock held across the downstream command's lifetime (FD inheritance). Requires flock.
+**Lock directory resolution** (`LLAMACPP_PREFLIGHT_LOCKDIR`):
+
+1. Explicit `LLAMACPP_PREFLIGHT_LOCKFILE` → use that path as-is (overrides everything).
+2. Explicit `LLAMACPP_PREFLIGHT_LOCKDIR` → use that directory.
+3. Root (`EUID=0`) → `/run/llamacpp-preflight` (created with mode 755).
+4. `XDG_RUNTIME_DIR` exists and writable → use it.
+5. `/run/user/<uid>` exists and writable → use it.
+6. Fallback → `/tmp`.
+
+**Root safety**: refuses `/tmp` when `EUID=0` — the script dies with an error directing you to set `LLAMACPP_PREFLIGHT_LOCKFILE` or `LLAMACPP_PREFLIGHT_LOCKDIR` to a path under `/run` or `/var/lock`. The lock parent directory must not be a symlink; when root, the parent must not be group/other-writable.
+
+**flock** (preferred): Opens the lockfile with `umask 077`, re-checks for symlink after open, then acquires with `flock -n`. If the lockfile already exists, it must be a regular file (not a symlink or special file).
+
+**mkdir fallback**: Creates `$LLAMACPP_PREFLIGHT_LOCKFILE.d/` with `mkdir -m 700`. Writes PID + `/proc/<pid>/stat` start time. Stale detection: if the recorded PID is dead OR the PID exists but its start time doesn't match the recorded value → the stale lock is reclaimed. This is immune to PID reuse (unlike the old age-based approach).
+
+Lock is **per-port** by default (`<lockdir>/llamacpp-preflight.<port>.lock`).
+
+`LLAMACPP_HOLD_LOCK=1`: keeps the flock held across the downstream command's lifetime (FD inheritance). Requires flock.
 
 ## Serving (`llamacpp-serve`)
 
@@ -683,7 +705,11 @@ LLAMACPP_ALLOW_KILL_OTHER_UID=1 flox activate --start-services
 
 ### GPU not detected
 
-Verify with `nvidia-smi`. To skip the GPU check:
+GPU detection uses a 3-tier cascade: CUDA driver probe → NVML → nvidia-smi. It works even without `nvidia-smi` installed, as long as the CUDA driver library (`libcuda.so.1`) is available. In containers, ensure the NVIDIA container runtime mounts the GPU device (e.g., `--gpus all` with Docker, or the NVIDIA device plugin in Kubernetes).
+
+If the CUDA probe reports 0 devices, the container was likely not started with GPU access.
+
+To skip the GPU check entirely:
 
 ```bash
 LLAMACPP_SKIP_GPU_CHECK=1 flox activate --start-services
@@ -736,14 +762,15 @@ Reduce memory pressure:
 If a previous run was killed mid-operation:
 
 ```bash
-# For llamacpp-preflight (per-port lock)
-rm -f /tmp/llamacpp-preflight.8080.lock
+# For llamacpp-preflight (per-port lock — path depends on LOCKDIR resolution;
+# check XDG_RUNTIME_DIR, /run/user/<uid>, or /tmp)
+rm -f "${XDG_RUNTIME_DIR:-/tmp}"/llamacpp-preflight.8080.lock
 
 # For llamacpp-resolve-model (per-model lock)
 rm -f "$LLAMACPP_MODELS_DIR"/.locks/llamacpp-resolve.*.lock
 ```
 
-The mkdir-based fallback includes stale PID/age detection and self-cleans after 30 seconds.
+The mkdir-based fallback includes stale detection via PID start time comparison (`/proc/<pid>/stat` field 22). If the recorded PID is dead or has a different start time, the lock is automatically reclaimed.
 
 ### Inspecting the generated command
 
@@ -790,7 +817,7 @@ Even in safe mode, the env file can set arbitrary environment variables, so prot
 
 - **Env files**: written with `umask 077` and `chmod 600` — readable only by the owning user.
 - **SHA256 files**: same permissions as env files.
-- **Lock files**: created with `umask 077`. Symlink safety is checked before opening.
+- **Lock files**: created with `umask 077`. Symlink safety is checked before opening and re-checked after open. When running as root, the lock parent directory is verified to not be group/other-writable. Root is refused `/tmp` locks entirely.
 - **Staging directories**: created under `$LLAMACPP_MODELS_DIR/.staging/` with `umask 077`.
 
 ### Model name validation
