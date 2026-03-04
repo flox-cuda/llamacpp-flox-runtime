@@ -1,0 +1,102 @@
+## Flox Environment Manifest -----------------------------------------
+##
+##   _Everything_ you need to know about the _manifest_ is here:
+##
+##   https://flox.dev/docs/reference/command-reference/manifest.toml/
+##
+## -------------------------------------------------------------------
+# Flox manifest version managed by Flox CLI
+version = 1
+
+
+## Install Packages --------------------------------------------------
+[install]
+llama-cpp.pkg-path = "flox-cuda/llama-cpp"
+llama-cpp.systems = ["x86_64-linux"]
+huggingface-hub.pkg-path = "python312Packages.huggingface-hub"
+# llamacpp-flox-runtime.pkg-path = "flox/llamacpp-flox-runtime"
+# llamacpp-flox-runtime.systems = ["x86_64-linux"]
+# llamacpp-flox-runtime.pkg-group = "llamacpp-flox-runtime"
+
+
+## Environment Variables ---------------------------------------------
+[vars]
+# All user-tunable vars live in [hook.on-activate] with ${VAR:-default}
+# fallbacks so they can be overridden via environment variables at
+# activation time (e.g., LLAMACPP_MODEL=MyModel flox activate).
+
+
+## Activation Hook ---------------------------------------------------
+[hook]
+on-activate = '''
+  # Model
+  export LLAMACPP_MODEL="${LLAMACPP_MODEL:-Meta-Llama-3.1-8B-Instruct-Q4_K_M}"
+  export LLAMACPP_MODEL_ORG="${LLAMACPP_MODEL_ORG:-bartowski}"
+  export LLAMACPP_MODEL_ID="${LLAMACPP_MODEL_ID:-bartowski/Meta-Llama-3.1-8B-Instruct-GGUF}"
+  export LLAMACPP_MODEL_FILE="${LLAMACPP_MODEL_FILE:-Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf}"
+  export LLAMACPP_QUANT="${LLAMACPP_QUANT:-Q4_K_M}"
+  export LLAMACPP_MODEL_SOURCES="${LLAMACPP_MODEL_SOURCES:-local,hf-cache,hf-hub}"
+  export LLAMACPP_MODELS_DIR="${LLAMACPP_MODELS_DIR:-$FLOX_ENV_PROJECT/models}"
+
+  # Server
+  export LLAMACPP_HOST="${LLAMACPP_HOST:-127.0.0.1}"
+  export LLAMACPP_PORT="${LLAMACPP_PORT:-8080}"
+
+  # Engine tuning
+  export LLAMACPP_N_GPU_LAYERS="${LLAMACPP_N_GPU_LAYERS:-99}"
+  export LLAMACPP_CTX_SIZE="${LLAMACPP_CTX_SIZE:-0}"
+  export LLAMACPP_PARALLEL="${LLAMACPP_PARALLEL:-4}"
+  export LLAMACPP_BATCH_SIZE="${LLAMACPP_BATCH_SIZE:-}"
+  export LLAMACPP_UBATCH_SIZE="${LLAMACPP_UBATCH_SIZE:-}"
+  export LLAMACPP_FLASH_ATTN="${LLAMACPP_FLASH_ATTN:-true}"
+  export LLAMACPP_CONT_BATCHING="${LLAMACPP_CONT_BATCHING:-true}"
+
+  # KV cache
+  export LLAMACPP_CACHE_TYPE_K="${LLAMACPP_CACHE_TYPE_K:-}"
+  export LLAMACPP_CACHE_TYPE_V="${LLAMACPP_CACHE_TYPE_V:-}"
+
+  # Multi-GPU
+  export LLAMACPP_SPLIT_MODE="${LLAMACPP_SPLIT_MODE:-}"
+  export LLAMACPP_TENSOR_SPLIT="${LLAMACPP_TENSOR_SPLIT:-}"
+  export LLAMACPP_MAIN_GPU="${LLAMACPP_MAIN_GPU:-}"
+
+  # Serving
+  export LLAMACPP_ALIAS="${LLAMACPP_ALIAS:-}"
+  export LLAMACPP_API_KEY="${LLAMACPP_API_KEY:-}"
+  export LLAMACPP_METRICS="${LLAMACPP_METRICS:-true}"
+  export LLAMACPP_JINJA="${LLAMACPP_JINJA:-true}"
+  export LLAMACPP_CHAT_TEMPLATE="${LLAMACPP_CHAT_TEMPLATE:-}"
+  export LLAMACPP_EMBEDDING="${LLAMACPP_EMBEDDING:-}"
+  export LLAMACPP_WEBUI="${LLAMACPP_WEBUI:-false}"
+  export LLAMACPP_REASONING_FORMAT="${LLAMACPP_REASONING_FORMAT:-}"
+
+  # Misc
+  export LLAMACPP_THREADS="${LLAMACPP_THREADS:-}"
+  export LLAMACPP_TIMEOUT="${LLAMACPP_TIMEOUT:-}"
+
+  # Scripts (until llamacpp-flox-runtime package is built)
+  export PATH="/home/daedalus/dev/builds/build-llamacpp-flox-runtime/scripts:$PATH"
+
+  mkdir -p "$LLAMACPP_MODELS_DIR"
+'''
+
+
+## Profile script ----------------------------------------------------
+[profile]
+
+
+## Services ---------------------------------------------------------
+[services]
+llamacpp.command = "llamacpp-preflight && llamacpp-resolve-model && llamacpp-serve"
+
+
+## Include ----------------------------------------------------------
+[include]
+
+
+## Build and publish your own packages ------------------------------
+[build]
+
+
+## Other Environment Options -----------------------------------------
+[options]
