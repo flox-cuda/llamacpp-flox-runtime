@@ -100,14 +100,14 @@ llamacpp-preflight && llamacpp-resolve-model && llamacpp-serve
 │  │    Output: per-model .env file (mode 600)          │  │
 │  ├────────────────────────────────────────────────────┤  │
 │  │  llamacpp-serve                                    │  │
-│  │    Loads .env → validates args → exec llama-server │  │
+│  │    Loads .env → validates → singleton lock → exec llama-server │  │
 │  └────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────┘
 ```
 
 1. **llamacpp-preflight** — Reclaims the port if occupied by a stale llama-server process, checks GPU health via a 3-tier cascade (CUDA driver → NVML → nvidia-smi), optionally executes a downstream command.
 2. **llamacpp-resolve-model** — Provisions the GGUF model from configured sources with locking, staging, atomic swaps, and sha256 integrity verification. Writes a per-model env file.
-3. **llamacpp-serve** — Loads the env file (safe or trusted mode), validates all required vars, builds the `llama-server` argv from env vars, and `exec`s.
+3. **llamacpp-serve** — Loads the env file (safe or trusted mode), validates all required vars, acquires a singleton lock, builds the `llama-server` argv from env vars (with secret redaction), and `exec`s. Supports TCP and unix socket modes.
 
 Scripts are provided by the `flox/llamacpp-flox-runtime` package and available on `PATH` after activation.
 
@@ -240,7 +240,8 @@ LLAMACPP_CTX_SIZE=8192 LLAMACPP_PARALLEL=8 flox activate --start-services
 | Variable | Default | CLI flag | Description |
 |----------|---------|----------|-------------|
 | `LLAMACPP_ALIAS` | _(unset)_ | `-a` | Model alias in API responses. When unset, llama-server uses the filename |
-| `LLAMACPP_API_KEY` | _(unset)_ | `--api-key` | Bearer token for API authentication. When unset, no auth is required |
+| `LLAMACPP_API_KEY` | _(unset)_ | _(env var)_ | Bearer token for API authentication. Exported as `LLAMA_API_KEY` (not on argv). When unset, no auth is required |
+| `LLAMACPP_API_KEY_FILE` | _(unset)_ | `--api-key-file` | Path to API key file. Mutually exclusive with `LLAMACPP_API_KEY` |
 | `LLAMACPP_METRICS` | `true` | `--metrics` | Enable Prometheus metrics endpoint at `/metrics` |
 | `LLAMACPP_JINJA` | `true` | `--jinja` / `--no-jinja` | Jinja2 chat template rendering |
 | `LLAMACPP_CHAT_TEMPLATE` | _(unset)_ | `--chat-template` | Override the model's built-in chat template |
@@ -516,6 +517,7 @@ Loads the resolved model env file and executes `llama-server` with validated arg
 llamacpp-serve                           # standard launch
 llamacpp-serve --print-cmd               # print the llama-server argv to stderr, then exec
 llamacpp-serve --dry-run                 # print the argv and exit 0 (no exec)
+llamacpp-serve --check                   # validate config + model + lock/bind, print argv, exit 0
 llamacpp-serve -h                        # show help
 llamacpp-serve -- --extra-flag val       # pass extra args through to llama-server
 ```
@@ -526,11 +528,11 @@ llamacpp-serve -- --extra-flag val       # pass extra args through to llama-serv
 
 | Variable | Validation | Description |
 |----------|------------|-------------|
-| `LLAMACPP_HOST` | Non-empty | Server bind address |
-| `LLAMACPP_PORT` | Positive integer | Server listen port |
+| `LLAMACPP_HOST` | Non-empty | Server bind address or unix socket path (must end in `.sock` for socket mode) |
 | `LLAMACPP_N_GPU_LAYERS` | Non-empty | GPU layers (`99`, `0`, or any non-negative integer) |
 | `LLAMACPP_CTX_SIZE` | Non-negative integer | Context size (`0` for model default) |
-| `LLAMACPP_PARALLEL` | Positive integer | Parallel inference slots |
+| `LLAMACPP_PARALLEL` | Integer: `-1` or > 0 | Parallel inference slots (`-1` for auto, or any positive integer) |
+| `LLAMACPP_PORT` | Integer, 1024-65535 | Server listen port. Ports < 1024 rejected. Required in TCP mode; optional (but validated if set) in unix socket mode |
 
 **Required when `LLAMACPP_MODEL_ENV_FILE` is not set** (the standard case):
 
@@ -545,6 +547,11 @@ llamacpp-serve -- --extra-flag val       # pass extra args through to llama-serv
 |----------|---------|-------------|
 | `LLAMACPP_MODEL_ENV_FILE` | Derived from `FLOX_ENV_CACHE` + model ID | Explicit env file path |
 | `LLAMACPP_ENV_FILE_TRUSTED` | `false` | Skip safe-mode parsing and `source` the file directly. Accepts `true`/`false`/`1`/`0`/`yes`/`no` |
+| `LLAMACPP_API_KEY_FILE` | _(empty)_ | Path to API key file. Mutually exclusive with `LLAMACPP_API_KEY`. Must exist and be readable |
+| `LLAMACPP_SINGLETON` | `true` | Acquire a per-host:port flock to prevent duplicate instances. `true`/`false`/`1`/`0`/`yes`/`no` |
+| `LLAMACPP_LOCK_DIR` | Cascade (see Locking) | Lock directory for singleton lock. Matches preflight cascade |
+| `LLAMACPP_ENV_FILE_ALLOW_PREFIXES` | `_LLAMACPP_,LLAMACPP_` | Comma-separated key prefixes allowed through safe-mode env file parsing |
+| `LLAMACPP_SOCKET_STALE_POLICY` | `external` | Unix socket stale policy: `external` (refuse), `safe-cleanup` (remove), `move-aside` (rename) |
 
 All optional engine/serving vars from the configuration reference tables above are also read by `llamacpp-serve` and mapped to CLI flags when non-empty.
 
@@ -554,6 +561,8 @@ Two modes, identical to the vLLM runtime:
 
 **Safe mode** (default): Parsed by a Python script enforcing a restricted `.env` subset — `KEY=VALUE` or `export KEY=VALUE`, optional quotes, no interpolation or command substitution. Requires `python3` on PATH.
 
+**Key filtering** (safe mode only): Only keys matching `LLAMACPP_ENV_FILE_ALLOW_PREFIXES` (default: `_LLAMACPP_,LLAMACPP_`) are exported. All other keys are silently skipped (logged as `# skipped <key>` in the intermediate file). This prevents the env file from overriding unrelated environment. Override with `LLAMACPP_ENV_FILE_ALLOW_PREFIXES` if your env file uses custom prefixes.
+
 **Trusted mode** (`LLAMACPP_ENV_FILE_TRUSTED=true`): `source`d directly as shell code.
 
 The env file must define `_LLAMACPP_RESOLVED_MODEL_PATH` or `llamacpp-serve` exits with an error. The GGUF file at that path must still exist.
@@ -562,11 +571,13 @@ The env file must define `_LLAMACPP_RESOLVED_MODEL_PATH` or `llamacpp-serve` exi
 
 `llamacpp-serve` builds the final argv as:
 
+API keys are never placed on the command line. `LLAMACPP_API_KEY` is exported as `LLAMA_API_KEY` (llama-server reads this natively). `LLAMACPP_API_KEY_FILE` maps to `--api-key-file`.
+
 ```bash
 llama-server \
   -m <_LLAMACPP_RESOLVED_MODEL_PATH> \
   --host <LLAMACPP_HOST> \
-  --port <LLAMACPP_PORT> \
+  [--port <LLAMACPP_PORT>]               # TCP mode only
   -ngl <LLAMACPP_N_GPU_LAYERS> \
   -c <LLAMACPP_CTX_SIZE> \
   -np <LLAMACPP_PARALLEL> \
@@ -579,12 +590,12 @@ llama-server \
   [-ts <LLAMACPP_TENSOR_SPLIT>]          # if set
   [-mg <LLAMACPP_MAIN_GPU>]              # if set
   [-a <LLAMACPP_ALIAS>]                  # if set
-  [--api-key <LLAMACPP_API_KEY>]         # if set
+  [--api-key-file <LLAMACPP_API_KEY_FILE>]  # if set (mutually exclusive with LLAMACPP_API_KEY)
   [--metrics]                            # if LLAMACPP_METRICS truthy
   [--jinja | --no-jinja]                 # if LLAMACPP_JINJA set
   [--chat-template <LLAMACPP_CHAT_TEMPLATE>]  # if set
   [--embedding]                          # if LLAMACPP_EMBEDDING truthy
-  [--cont-batching]                      # if LLAMACPP_CONT_BATCHING truthy
+  [--cont-batching | --no-cont-batching] # if LLAMACPP_CONT_BATCHING set
   [--webui | --no-webui]                 # if LLAMACPP_WEBUI set
   [-to <LLAMACPP_TIMEOUT>]              # if set
   [-t <LLAMACPP_THREADS>]               # if set
@@ -598,10 +609,10 @@ The env var to llama-server CLI flag mapping:
 |---------|----------|-----------|
 | `_LLAMACPP_RESOLVED_MODEL_PATH` | `-m` | Always |
 | `LLAMACPP_HOST` | `--host` | Always |
-| `LLAMACPP_PORT` | `--port` | Always |
+| `LLAMACPP_PORT` | `--port` | TCP mode only (always when set) |
 | `LLAMACPP_N_GPU_LAYERS` | `-ngl` | Always |
 | `LLAMACPP_CTX_SIZE` | `-c` | Always |
-| `LLAMACPP_PARALLEL` | `-np` | Always |
+| `LLAMACPP_PARALLEL` | `-np` | Always (accepts `-1` for auto) |
 | `LLAMACPP_BATCH_SIZE` | `-b` | When set |
 | `LLAMACPP_UBATCH_SIZE` | `-ub` | When set |
 | `LLAMACPP_FLASH_ATTN` | `-fa on` / `-fa off` | When set |
@@ -611,12 +622,13 @@ The env var to llama-server CLI flag mapping:
 | `LLAMACPP_TENSOR_SPLIT` | `-ts` | When set |
 | `LLAMACPP_MAIN_GPU` | `-mg` | When set |
 | `LLAMACPP_ALIAS` | `-a` | When set |
-| `LLAMACPP_API_KEY` | `--api-key` | When set |
+| `LLAMACPP_API_KEY` | _(no CLI flag)_ | Exported as `LLAMA_API_KEY` env var when set |
+| `LLAMACPP_API_KEY_FILE` | `--api-key-file` | When set (mutually exclusive with `LLAMACPP_API_KEY`) |
 | `LLAMACPP_METRICS` | `--metrics` | When truthy |
 | `LLAMACPP_JINJA` | `--jinja` / `--no-jinja` | When set |
 | `LLAMACPP_CHAT_TEMPLATE` | `--chat-template` | When set |
 | `LLAMACPP_EMBEDDING` | `--embedding` | When truthy |
-| `LLAMACPP_CONT_BATCHING` | `--cont-batching` | When truthy |
+| `LLAMACPP_CONT_BATCHING` | `--cont-batching` / `--no-cont-batching` | When set |
 | `LLAMACPP_WEBUI` | `--webui` / `--no-webui` | When set |
 | `LLAMACPP_TIMEOUT` | `-to` | When set |
 | `LLAMACPP_THREADS` | `-t` | When set |
@@ -768,6 +780,9 @@ rm -f "${XDG_RUNTIME_DIR:-/tmp}"/llamacpp-preflight.8080.lock
 
 # For llamacpp-resolve-model (per-model lock)
 rm -f "$LLAMACPP_MODELS_DIR"/.locks/llamacpp-resolve.*.lock
+
+# For llamacpp-serve (per host:port singleton lock — path depends on LOCK_DIR resolution)
+rm -f "${XDG_RUNTIME_DIR:-/tmp}"/llamacpp-serve.*.lock
 ```
 
 The mkdir-based fallback includes stale detection via PID start time comparison (`/proc/<pid>/stat` field 22). If the recorded PID is dead or has a different start time, the lock is automatically reclaimed.
@@ -777,7 +792,10 @@ The mkdir-based fallback includes stale detection via PID start time comparison 
 ```bash
 llamacpp-serve --print-cmd   # print the llama-server argv to stderr, then run it
 llamacpp-serve --dry-run     # print the argv and exit without running
+llamacpp-serve --check       # validate config + model + lock/bind, print argv, exit 0
 ```
+
+Printed argv is redacted — API keys, tokens, and auth headers are replaced with `<redacted>`.
 
 ### Passing extra llama-server flags
 
@@ -811,7 +829,7 @@ The runtime scripts handle untrusted input (model names, env files, lock files) 
 
 The model env file is a trust boundary. In safe mode (default), `llamacpp-serve` parses the file with a restrictive Python parser that rejects shell interpolation and command substitution. In trusted mode, the file is `source`d directly — only enable this for env files you control.
 
-Even in safe mode, the env file can set arbitrary environment variables, so protect its location.
+Even in safe mode, protect the env file location. In safe mode, key filtering (default prefix allowlist: `_LLAMACPP_,LLAMACPP_`) prevents the env file from setting arbitrary environment variables. Only keys matching the allowed prefixes are exported; all others are dropped.
 
 ### File permissions
 
@@ -819,6 +837,12 @@ Even in safe mode, the env file can set arbitrary environment variables, so prot
 - **SHA256 files**: same permissions as env files.
 - **Lock files**: created with `umask 077`. Symlink safety is checked before opening and re-checked after open. When running as root, the lock parent directory is verified to not be group/other-writable. Root is refused `/tmp` locks entirely.
 - **Staging directories**: created under `$LLAMACPP_MODELS_DIR/.staging/` with `umask 077`.
+
+### API key handling
+
+`LLAMACPP_API_KEY` is never placed on the `llama-server` command line. It is exported as the `LLAMA_API_KEY` environment variable, which `llama-server` reads natively. This prevents leakage via `/proc/<pid>/cmdline`. When using `--print-cmd` or `--dry-run`, all secret-bearing flags (`--api-key`, `--token`, auth headers) are redacted in the printed output.
+
+`LLAMACPP_API_KEY_FILE` maps to `--api-key-file <path>` (the file path itself is not secret). The two options are mutually exclusive.
 
 ### Model name validation
 
