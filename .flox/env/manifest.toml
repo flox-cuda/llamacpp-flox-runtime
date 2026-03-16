@@ -1,4 +1,4 @@
-schema-version = "1.10.0"
+version = 1
 
 
 ## Install Packages --------------------------------------------------
@@ -10,7 +10,7 @@ llamacpp-flox-runtime.pkg-group = "llamacpp-flox-runtime"
 llamacpp-flox-runtime.version = "0.9.2"
 llamacpp-flox-runtime.systems = ["x86_64-linux"]
 huggingface-hub.pkg-path = "python312Packages.huggingface-hub"
-huggingface-hub.outputs = "all"
+#huggingface-hub.outputs = "all"
 
 ## Environment Variables ---------------------------------------------
 [vars]
